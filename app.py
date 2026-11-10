@@ -47,6 +47,13 @@ def init_db():
         created_at INTEGER, expires_at INTEGER, used_at INTEGER);
     CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, actor TEXT, action TEXT, detail TEXT);
     """)
+    ocols = [r[1] for r in c.execute("PRAGMA table_info(orders)")]
+    if "pin_salt" not in ocols:
+        c.execute("ALTER TABLE orders ADD COLUMN pin_salt TEXT")
+        c.execute("ALTER TABLE orders ADD COLUMN pin_hash TEXT")
+    scols = [r[1] for r in c.execute("PRAGMA table_info(sessions)")]
+    if "order_id" not in scols:
+        c.execute("ALTER TABLE sessions ADD COLUMN order_id INTEGER")
     for k, v in (("ttl_minutes", "5"), ("per_hour_limit", "5"), ("site_name", "OTP CENTER")):
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
     c.commit(); c.close()
@@ -58,11 +65,11 @@ def get_setting(c, key, default=""):
 def audit(c, actor, action, detail=""):
     c.execute("INSERT INTO audit(ts,actor,action,detail) VALUES(?,?,?,?)", (now(), actor, action, detail))
 
-def make_session(c, role, customer_id=None):
+def make_session(c, role, customer_id=None, order_id=None):
     token = secrets.token_urlsafe(32)
     th = hashlib.sha256(token.encode()).hexdigest()
-    c.execute("INSERT INTO sessions(token_hash,role,customer_id,expires) VALUES(?,?,?,?)",
-              (th, role, customer_id, now() + SESSION_TTL))
+    c.execute("INSERT INTO sessions(token_hash,role,customer_id,expires,order_id) VALUES(?,?,?,?,?)",
+              (th, role, customer_id, now() + SESSION_TTL, order_id))
     return token
 
 def read_session(c, handler):
@@ -143,10 +150,19 @@ class Handler(BaseHTTPRequestHandler):
         return s
 
     def need_customer(self, c):
+        self._scope_order_id = None
         s = read_session(c, self)
-        if not s or s["role"] != "customer":
-            self.send_json({"error": "需要顾客登录"}, 401)
+        if not s or s["role"] not in ("customer", "order"):
+            self.send_json({"error": "需要先凭订单号+取码口令进入"}, 401)
             return None
+        if s["role"] == "order":
+            o = c.execute("SELECT * FROM orders WHERE id=?", (s["order_id"],)).fetchone()
+            if not o:
+                self.send_json({"error": "订单不存在"}, 404)
+                return None
+            self._scope_order_id = o["id"]
+            row = c.execute("SELECT * FROM customers WHERE id=?", (o["customer_id"],)).fetchone()
+            return row
         row = c.execute("SELECT * FROM customers WHERE id=?", (s["customer_id"],)).fetchone()
         if not row or not row["active"]:
             self.send_json({"error": "账号已停用或不存在"}, 403)
@@ -163,7 +179,7 @@ class Handler(BaseHTTPRequestHandler):
             s = read_session(c, self)
             role = s["role"] if s else None
             cust = None
-            if s and s["role"] == "customer":
+            if s and s["role"] in ("customer", "order"):
                 r = c.execute("SELECT username, display_name FROM customers WHERE id=?", (s["customer_id"],)).fetchone()
                 cust = dict(r) if r else None
             self.send_json({"has_admin": has_admin, "role": role, "customer": cust,
@@ -174,7 +190,7 @@ class Handler(BaseHTTPRequestHandler):
             t = now(); day = t - (t % 86400)
             q = lambda sql, a=(): c.execute(sql, a).fetchone()[0]
             self.send_json({
-                "customers": q("SELECT COUNT(*) FROM customers"),
+                "customers": q("SELECT COUNT(*) FROM customers WHERE username NOT LIKE 'otp%'"),
                 "orders": q("SELECT COUNT(*) FROM orders"),
                 "codes_total": q("SELECT COUNT(*) FROM codes"),
                 "codes_used": q("SELECT COUNT(*) FROM codes WHERE status='已核销'"),
@@ -217,7 +233,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/my/orders":
             me = self.need_customer(c)
             if not me: return
-            rows = c.execute("SELECT * FROM orders WHERE customer_id=? ORDER BY id DESC", (me["id"],)).fetchall()
+            if getattr(self, "_scope_order_id", None):
+                rows = c.execute("SELECT * FROM orders WHERE id=? AND customer_id=?", (self._scope_order_id, me["id"])).fetchall()
+            else:
+                rows = c.execute("SELECT * FROM orders WHERE customer_id=? ORDER BY id DESC", (me["id"],)).fetchall()
             out = []
             for r in rows:
                 d = dict(r)
@@ -230,9 +249,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/my/history":
             me = self.need_customer(c)
             if not me: return
-            rows = c.execute("""SELECT co.id, co.status, co.created_at, co.expires_at, co.used_at, o.order_no
-                FROM codes co JOIN orders o ON o.id=co.order_id
-                WHERE co.customer_id=? ORDER BY co.id DESC LIMIT 100""", (me["id"],)).fetchall()
+            if getattr(self, "_scope_order_id", None):
+                rows = c.execute("""SELECT co.id, co.status, co.created_at, co.expires_at, co.used_at, o.order_no
+                    FROM codes co JOIN orders o ON o.id=co.order_id
+                    WHERE co.customer_id=? AND co.order_id=? ORDER BY co.id DESC LIMIT 100""", (me["id"], self._scope_order_id)).fetchall()
+            else:
+                rows = c.execute("""SELECT co.id, co.status, co.created_at, co.expires_at, co.used_at, o.order_no
+                    FROM codes co JOIN orders o ON o.id=co.order_id
+                    WHERE co.customer_id=? ORDER BY co.id DESC LIMIT 100""", (me["id"],)).fetchall()
             self.send_json({"history": [dict(r) for r in rows]})
             return
         self.send_json({"error": "not found"}, 404)
@@ -300,14 +324,48 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "active": newv}); return
         if path == "/api/admin/orders":
             if not self.need_admin(c): return
-            cust = c.execute("SELECT * FROM customers WHERE id=?", (data.get("customer_id"),)).fetchone()
-            if not cust:
-                self.send_json({"error": "请选择顾客"}, 400); return
             order_no = "OTP" + time.strftime("%Y%m%d") + secrets.token_hex(3).upper()
-            c.execute("INSERT INTO orders(order_no,customer_id,item,note,status,created_at) VALUES(?,?,?,?, '进行中', ?)",
-                      (order_no, cust["id"], str(data.get("item") or ""), str(data.get("note") or ""), now()))
-            audit(c, "admin", "新建订单", order_no + " -> " + cust["username"])
-            self.send_json({"ok": True, "order_no": order_no}); return
+            cust = None
+            if data.get("customer_id"):
+                cust = c.execute("SELECT * FROM customers WHERE id=?", (data.get("customer_id"),)).fetchone()
+            if not cust:
+                buyer = str(data.get("buyer") or "买家").strip()[:40] or "买家"
+                salt0, h0 = pw_hash(secrets.token_urlsafe(18))
+                c.execute("INSERT INTO customers(username,display_name,salt,pass_hash,active,created_at) VALUES(?,?,?,?,1,?)",
+                          (order_no.lower(), buyer, salt0, h0, now()))
+                cust = c.execute("SELECT * FROM customers WHERE username=?", (order_no.lower(),)).fetchone()
+            pin = f"{secrets.randbelow(1000000):06d}"
+            psalt, phash = pw_hash(pin)
+            c.execute("INSERT INTO orders(order_no,customer_id,item,note,status,created_at,pin_salt,pin_hash) VALUES(?,?,?,?, '进行中', ?, ?, ?)",
+                      (order_no, cust["id"], str(data.get("item") or ""), str(data.get("note") or ""), now(), psalt, phash))
+            audit(c, "admin", "新建订单", order_no + " -> " + cust["display_name"])
+            self.send_json({"ok": True, "order_no": order_no, "pin": pin}); return
+        if path == "/api/admin/orders/reset_pin":
+            if not self.need_admin(c): return
+            o = c.execute("SELECT * FROM orders WHERE id=?", (data.get("id"),)).fetchone()
+            if not o:
+                self.send_json({"error": "订单不存在"}, 404); return
+            pin = f"{secrets.randbelow(1000000):06d}"
+            psalt, phash = pw_hash(pin)
+            c.execute("UPDATE orders SET pin_salt=?, pin_hash=? WHERE id=?", (psalt, phash, o["id"]))
+            audit(c, "admin", "重置取码口令", o["order_no"])
+            self.send_json({"ok": True, "order_no": o["order_no"], "pin": pin}); return
+        if path == "/api/order/login":
+            order_no = str(data.get("order_no") or "").strip().upper()
+            pin = str(data.get("pin") or "").strip()
+            fails = c.execute("SELECT COUNT(*) FROM audit WHERE action='口令校验失败' AND detail=? AND ts>=?",
+                              (order_no, now() - 600)).fetchone()[0]
+            if fails >= 10:
+                self.send_json({"error": "口令错误次数太多，请 10 分钟后再试，或联系店主"}, 429); return
+            o = c.execute("SELECT * FROM orders WHERE order_no=?", (order_no,)).fetchone()
+            if not o or not o["pin_hash"] or not pw_check(pin, o["pin_salt"], o["pin_hash"]):
+                audit(c, order_no or "?", "口令校验失败", order_no)
+                self.send_json({"error": "订单号或取码口令不正确"}, 401); return
+            if o["status"] == "已取消":
+                self.send_json({"error": "该订单已取消，请联系店主"}, 403); return
+            token = make_session(c, "order", o["customer_id"], o["id"])
+            audit(c, order_no, "买家凭口令进入")
+            self.send_json({"ok": True, "order_no": order_no}, cookie=self.session_cookie(token)); return
         if path == "/api/admin/orders/status":
             if not self.need_admin(c): return
             st = str(data.get("status") or "")
@@ -358,6 +416,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/my/claim":
             me = self.need_customer(c)
             if not me: return
+            if getattr(self, "_scope_order_id", None) and data.get("order_id") != self._scope_order_id:
+                self.send_json({"error": "只能为自己进入的订单取码"}, 403); return
             o = c.execute("SELECT * FROM orders WHERE id=? AND customer_id=?", (data.get("order_id"), me["id"])).fetchone()
             if not o:
                 self.send_json({"error": "订单不存在或不属于你"}, 404); return
@@ -419,10 +479,10 @@ th{color:var(--sub);font-weight:500}.scroll{overflow-x:auto}
 
 <!-- 顾客端 -->
 <div id="viewCust">
-  <div class="card" id="custLoginCard"><h2>顾客登录</h2>
-    <input id="cu_name" placeholder="登录名"><input id="cu_pw" type="password" placeholder="密码">
-    <div class="msg" id="cu_msg"></div><button class="btn" onclick="custLogin()">登录</button>
-    <p class="note">账号由店主在管理员后台创建。登录后只能看到分配给你的订单。</p></div>
+  <div class="card" id="custLoginCard"><h2>凭订单取码（不用注册）</h2>
+    <input id="cu_order" placeholder="订单号（店主发给你的）"><input id="cu_pin" inputmode="numeric" placeholder="取码口令（6 位数字）">
+    <div class="msg" id="cu_msg"></div><button class="btn" onclick="orderLogin()">进入我的订单</button>
+    <p class="note">订单号和取码口令由店主随订单一起发给你。凭这两样只能看到这一笔订单，看不到别人的。</p></div>
   <div id="custMain" class="hide">
     <div class="card"><div class="row" style="align-items:center"><div><h2 style="margin:0">我的订单</h2><p class="note" id="custWho"></p></div><button class="ghost" onclick="logout()">退出登录</button></div>
       <div id="myOrders"></div></div>
@@ -453,15 +513,19 @@ th{color:var(--sub);font-weight:500}.scroll{overflow-x:auto}
       <button onclick="logout()">退出</button>
     </div>
     <div id="at_overview" class="card"><h2>数据总览</h2><div class="grid" id="ovGrid"></div>
-      <p class="note">使用流程：建顾客 → 建订单 → 顾客在顾客端登录取码 → 你在这里核销验证。</p></div>
+      <p class="note">使用流程：建订单 → 把订单号+取码口令发给买家 → 买家在首页凭这两样取码 → 你在这里核销验证。顾客账号页签是老版账号功能，可不用。</p></div>
     <div id="at_customers" class="card hide"><h2>新建顾客</h2>
       <div class="row"><input id="nc_user" placeholder="登录名"><input id="nc_name" placeholder="显示名（可选）"><input id="nc_pw" placeholder="登录密码（至少6位）"></div>
       <div class="msg" id="nc_msg"></div><button class="btn" onclick="createCustomer()">创建顾客</button>
       <h3 style="margin-top:18px">顾客列表</h3><div class="scroll"><table><thead><tr><th>登录名</th><th>显示名</th><th>状态</th><th>操作</th></tr></thead><tbody id="custList"></tbody></table></div></div>
     <div id="at_orders" class="card hide"><h2>新建订单</h2>
-      <div class="row"><select id="no_cust"></select><input id="no_item" placeholder="商品 / 服务名称"><input id="no_note" placeholder="备注（可选）"></div>
+      <div class="row"><input id="no_buyer" placeholder="买家称呼（自己记账用）"><input id="no_item" placeholder="商品 / 服务名称"><input id="no_note" placeholder="备注（可选）"></div>
       <div class="msg" id="no_msg"></div><button class="btn" onclick="createOrder()">创建订单</button>
-      <h3 style="margin-top:18px">订单列表</h3><div class="scroll"><table><thead><tr><th>订单号</th><th>顾客</th><th>商品</th><th>状态</th><th>操作</th></tr></thead><tbody id="ordList"></tbody></table></div></div>
+      <div id="pinShow" class="hide" style="margin-top:12px;border:1px dashed var(--acc);border-radius:12px;padding:12px">
+        <p class="note" style="margin:0 0 8px">把下面两行发给买家（取码口令只在生成时显示，丢了就在订单列表点「重置口令」）：</p>
+        <b id="pinText" style="white-space:pre-line"></b><br>
+        <button class="btn mini" style="margin-top:8px" onclick="copyPin()">一键复制给买家</button></div>
+      <h3 style="margin-top:18px">订单列表</h3><div class="scroll"><table><thead><tr><th>订单号</th><th>买家</th><th>商品</th><th>状态</th><th>操作</th></tr></thead><tbody id="ordList"></tbody></table></div></div>
     <div id="at_codes" class="card hide"><h2>验证码记录</h2><div class="scroll"><table><thead><tr><th>订单号</th><th>顾客</th><th>生成</th><th>到期</th><th>状态</th><th>操作</th></tr></thead><tbody id="codeList"></tbody></table></div></div>
     <div id="at_verify" class="card hide"><h2>核销验证</h2>
       <div class="row"><input id="vf_no" placeholder="订单号"><input id="vf_code" placeholder="顾客给的 6 位验证码"></div>
@@ -484,10 +548,10 @@ const fmt=t=>t?new Date(t*1000).toLocaleString('zh-CN',{hour12:false}):'-';
 let lastCode='',countTimer=null;
 function showView(v){$('viewCust').classList.toggle('hide',v!=='cust');$('viewAdmin').classList.toggle('hide',v!=='admin');$('tabCust').classList.toggle('on',v==='cust');$('tabAdmin').classList.toggle('on',v==='admin');if(v==='admin')initAdmin();}
 async function boot(){const{d}=await api('/api/state');window._state=d;
-  if(d.role==='customer'){showCustMain(d.customer)} if(d.role==='admin'){$('adminGate').classList.add('hide');$('adminMain').classList.remove('hide');loadOverview();}
+  if(d.role==='customer'||d.role==='order'){showCustMain(d.customer||{})} if(d.role==='admin'){$('adminGate').classList.add('hide');$('adminMain').classList.remove('hide');loadOverview();}
   if(!d.has_admin){$('gateTitle').textContent='设置管理员口令（首次）';$('gateBtn').textContent='设置并进入后台';}}
-async function custLogin(){const{d,r}=await api('/api/customer/login',{method:'POST',body:JSON.stringify({username:$('cu_name').value,password:$('cu_pw').value})});
-  if(!r.ok){$('cu_msg').textContent=d.error||'登录失败';return}$('cu_msg').textContent='';showCustMain({username:$('cu_name').value,display_name:d.display_name});}
+async function orderLogin(){const{d,r}=await api('/api/order/login',{method:'POST',body:JSON.stringify({order_no:$('cu_order').value,pin:$('cu_pin').value})});
+  if(!r.ok){$('cu_msg').textContent=d.error||'进入失败';return}$('cu_msg').textContent='';showCustMain({username:d.order_no,display_name:'订单 '+d.order_no});}
 function showCustMain(cust){$('custLoginCard').classList.add('hide');$('custMain').classList.remove('hide');$('custWho').textContent='当前账号：'+(cust.display_name||cust.username);loadMy();}
 async function logout(){await api('/api/logout',{method:'POST',body:'{}'});location.reload();}
 async function loadMy(){const{d}=await api('/api/my/orders');const box=$('myOrders');
@@ -510,7 +574,7 @@ async function adminGate(){const{d}=await api('/api/state');const path=d.has_adm
   if(!r.ok){$('ad_msg').textContent=res.error||'失败';return}$('adminGate').classList.add('hide');$('adminMain').classList.remove('hide');loadOverview();}
 function adminTab(t){document.querySelectorAll('[data-st]').forEach(b=>b.classList.toggle('on',b.dataset.st===t));
   ['overview','customers','orders','codes','verify','audit','settings'].forEach(x=>$('at_'+x).classList.toggle('hide',x!==t));
-  if(t==='overview')loadOverview();if(t==='customers')loadCustomers();if(t==='orders'){loadOrders();fillCustSelect();}if(t==='codes')loadCodes();if(t==='audit')loadAudit();if(t==='settings')loadSettings();}
+  if(t==='overview')loadOverview();if(t==='customers')loadCustomers();if(t==='orders')loadOrders();if(t==='codes')loadCodes();if(t==='audit')loadAudit();if(t==='settings')loadSettings();}
 async function loadOverview(){const{d}=await api('/api/admin/overview');const items=[['顾客数',d.customers],['订单数',d.orders],['验证码总数',d.codes_total],['已核销',d.codes_used],['已过期',d.codes_expired],['今日生成',d.codes_today]];
   $('ovGrid').innerHTML=items.map(x=>`<div class="stat"><b>${x[1]??0}</b><span>${x[0]}</span></div>`).join('');}
 async function loadCustomers(){const{d}=await api('/api/admin/customers');window._custs=d.customers||[];
@@ -519,10 +583,16 @@ async function createCustomer(){const{d,r}=await api('/api/admin/customers',{met
   $('nc_msg').textContent=r.ok?'创建成功':(d.error||'失败');$('nc_msg').className='msg '+(r.ok?'okmsg':'');if(r.ok)loadCustomers();}
 async function toggleCust(id){await api('/api/admin/customers/toggle',{method:'POST',body:JSON.stringify({id})});loadCustomers();}
 function fillCustSelect(){if(!window._custs)loadCustomers().then(fillCustSelect);else $('no_cust').innerHTML=window._custs.filter(x=>x.active).map(x=>`<option value="${x.id}">${x.username}（${x.display_name||''}）</option>`).join('');}
-async function loadOrders(){const{d}=await api('/api/admin/orders');$('ordList').innerHTML=(d.orders||[]).map(o=>`<tr><td>${o.order_no}</td><td>${o.username}</td><td>${o.item||''}</td><td>${o.status}</td><td>
-  <select style="width:auto;padding:5px;margin:0" onchange="setStatus(${o.id},this.value)"><option ${o.status==='进行中'?'selected':''}>进行中</option><option ${o.status==='已完成'?'selected':''}>已完成</option><option ${o.status==='已取消'?'selected':''}>已取消</option></select></td></tr>`).join('')||'<tr><td colspan="5" class="note">暂无订单</td></tr>';}
-async function createOrder(){const{d,r}=await api('/api/admin/orders',{method:'POST',body:JSON.stringify({customer_id:Number($('no_cust').value),item:$('no_item').value,note:$('no_note').value})});
-  $('no_msg').textContent=r.ok?('创建成功，订单号 '+d.order_no):(d.error||'失败');$('no_msg').className='msg '+(r.ok?'okmsg':'');if(r.ok)loadOrders();}
+async function loadOrders(){const{d}=await api('/api/admin/orders');$('ordList').innerHTML=(d.orders||[]).map(o=>`<tr><td>${o.order_no}</td><td>${o.display_name||o.username}</td><td>${o.item||''}</td><td>${o.status}</td><td>
+  <select style="width:auto;padding:5px;margin:0" onchange="setStatus(${o.id},this.value)"><option ${o.status==='进行中'?'selected':''}>进行中</option><option ${o.status==='已完成'?'selected':''}>已完成</option><option ${o.status==='已取消'?'selected':''}>已取消</option></select>
+  <button class="ghost" onclick="resetPin(${o.id})">重置口令</button></td></tr>`).join('')||'<tr><td colspan="5" class="note">暂无订单</td></tr>';}
+let lastPinText='';
+function showPin(orderNo,pin){lastPinText='订单号：'+orderNo+'\n取码口令：'+pin+'\n取码地址：'+location.origin+'/';$('pinText').textContent=lastPinText;$('pinShow').classList.remove('hide');}
+function copyPin(){if(lastPinText)navigator.clipboard.writeText(lastPinText).then(()=>alert('已复制，发给买家即可'));}
+async function createOrder(){const{d,r}=await api('/api/admin/orders',{method:'POST',body:JSON.stringify({buyer:$('no_buyer').value,item:$('no_item').value,note:$('no_note').value})});
+  $('no_msg').textContent=r.ok?'创建成功':(d.error||'失败');$('no_msg').className='msg '+(r.ok?'okmsg':'');if(r.ok){showPin(d.order_no,d.pin);loadOrders();}}
+async function resetPin(id){const{d,r}=await api('/api/admin/orders/reset_pin',{method:'POST',body:JSON.stringify({id})});
+  if(r.ok){showPin(d.order_no,d.pin);alert('新口令已生成，旧口令作废，把新的发给买家');}else alert(d.error||'失败');}
 async function setStatus(id,st){await api('/api/admin/orders/status',{method:'POST',body:JSON.stringify({id,status:st})});loadOrders();}
 async function loadCodes(){const{d}=await api('/api/admin/codes');$('codeList').innerHTML=(d.codes||[]).map(x=>`<tr><td>${x.order_no}</td><td>${x.username}</td><td>${fmt(x.created_at)}</td><td>${fmt(x.expires_at)}</td><td>${x.status}</td><td>${x.status==='有效'?`<button class="ghost" onclick="revokeCode(${x.id})">撤销</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6" class="note">暂无记录</td></tr>';}
 async function revokeCode(id){await api('/api/admin/codes/revoke',{method:'POST',body:JSON.stringify({id})});loadCodes();}
